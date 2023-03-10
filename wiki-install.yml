@@ -1,0 +1,142 @@
+- name: Install Wiki.js
+  hosts: all
+  become: true
+  tasks:
+    - name: Add the user 'speedypleath' and add it to 'sudo'
+      ansible.builtin.user:
+        name: speedypleath
+        group: sudo
+
+    - name: Add SSH key to 'speedypleath'
+      ansible.posix.authorized_key:
+        user: speedypleath
+        state: present
+        key: "{{ lookup('file', pub_key) }}"
+
+    - name: Install DigitalOcean repo key
+      ansible.builtin.apt_key:
+        url: https://repos.sonar.digitalocean.com/sonar-agent.asc
+        state: present
+
+    - name: Install DigitalOcean apt repo
+      ansible.builtin.apt_repository:
+        repo: deb https://repos.sonar.digitalocean.com/apt main main
+        state: present
+        update_cache: true
+
+    - name: Add Docker GPG apt Key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      ansible.builtin.apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+        update_cache: true
+
+    - name: Update all packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install DigitalOcean agent and docker dependencies
+      action: ansible.builtin.apt name={{ item }} state=present
+      with_items:
+        - do-agent
+        - ca-certificates
+        - curl
+        - gnupg
+        - lsb-release
+
+    - name: Update apt and install docker-ce
+      ansible.builtin.apt:
+        name: docker-ce
+        state: latest
+        update_cache: true
+
+    - name: Create installation directory for Wiki.js
+      ansible.builtin.file:
+        path: /etc/wiki
+        state: directory
+        mode: '0755'
+
+    - name: Check if secret file exists
+      ansible.builtin.stat:
+        path: /etc/wiki/.db-secret
+      register: db_secret
+
+    - name: Generation of SSL key
+      ansible.builtin.shell: openssl rand -base64 32 > /etc/wiki/.db-secret
+      register: secret_key_command
+      changed_when: not db_secret.stat.exists
+
+    - name: Create internal docker network
+      community.docker.docker_network:
+        name: wikinet
+
+    - name: Create data volume for PostgreSQL
+      community.docker.docker_volume:
+        name: pgdata
+
+    - name: Pull Wiki.js docker image
+      community.docker.docker_image:
+        name: "ghcr.io/requarks/wiki"
+        source: pull
+
+    - name: Pull Wiki.js update companion docker image
+      community.docker.docker_image:
+        name: "ghcr.io/requarks/wiki-update-companion"
+        source: pull
+
+    - name: Pull postgres docker image
+      community.docker.docker_image:
+        name: "postgres"
+        source: pull
+
+    - name: Create postgres container
+      community.docker.docker_container:
+        name: "db"
+        image: "postgres:11"
+        state: started
+        env:
+          POSTGRES_DB: wiki
+          POSTGRES_USER: wiki
+          POSTGRES_PASSWORD_FILE: /etc/wiki/.db-secret
+        volumes:
+          - /etc/wiki/.db-secret:/etc/wiki/.db-secret:ro
+          - pgdata:/var/lib/postgresql/data
+        networks:
+          - name: wikinet
+
+    - name: Create Wiki.js container
+      community.docker.docker_container:
+        name: "wiki"
+        image: "ghcr.io/requarks/wiki:2"
+        state: started
+        env:
+          DB_TYPE: postgres
+          DB_HOST: db
+          DB_PORT: "5432"
+          DB_PASS_FILE: /etc/wiki/.db-secret
+          DB_USER: wiki
+          DB_NAME: wiki
+          UPGRADE_COMPANION: "1"
+        volumes:
+          - /etc/wiki/.db-secret:/etc/wiki/.db-secret:ro
+        networks:
+          - name: wikinet
+        ports:
+          - 80:3000
+          - 443:3443
+
+    - name: Create Wiki.js update companion container
+      community.docker.docker_container:
+        name: "wiki-update-companion"
+        image: "ghcr.io/requarks/wiki-update-companion:latest"
+        state: started
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock:ro
+        networks:
+          - name: wikinet
